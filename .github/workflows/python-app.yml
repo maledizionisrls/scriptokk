@@ -1,14 +1,10 @@
-name: Esegui script Python
+name: Esegui script manualmente
 
 on:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: "0 */2 * * *"  # Esegue lo script ogni 2 ore
+  workflow_dispatch:  # Permette di avviare il workflow manualmente
 
 jobs:
-  build:
+  run-script:
     runs-on: ubuntu-latest
 
     steps:
