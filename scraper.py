@@ -1,13 +1,11 @@
 """
 Gestione dello scraping dei video TikTok
 """
-from typing import List, Dict, Optional
-import pyktok as pyk
+from typing import Dict, List, Optional
 import json
 import time
 import requests
 from playwright.async_api import async_playwright
-import asyncio
 from config import CONFIG, BROWSER_CONFIG, API_CONFIG
 
 class TikTokScraper:
@@ -15,62 +13,34 @@ class TikTokScraper:
         self.config = CONFIG
         self.browser_config = BROWSER_CONFIG
         self.api_config = API_CONFIG
+        self.headers = {
+            'User-Agent': BROWSER_CONFIG['user_agent'],
+            'Accept': 'application/json',
+            'Referer': API_CONFIG['base_referer']
+        }
 
     async def extract_auth_params(self) -> Optional[Dict[str, str]]:
         """Estrae i parametri di autenticazione necessari"""
-        for attempt in range(self.config['MAX_AUTH_RETRIES']):
-            target_params = None
-            request_event = asyncio.Event()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
             
-            async with async_playwright() as p:
-                print(f"Tentativo {attempt + 1} di {self.config['MAX_AUTH_RETRIES']} per l'estrazione dei parametri di autenticazione...")
-                browser = None
-                try:
-                    browser = await p.chromium.launch(headless=True)
-                    context = await browser.new_context(
-                        viewport=self.browser_config['viewport'],
-                        user_agent=self.browser_config['user_agent']
-                    )
-                    
-                    page = await context.new_page()
-                    
-                    async def handle_request(request):
-                        if "creative_radar_api/v1/popular_trend/list" in request.url:
-                            headers = request.headers
-                            nonlocal target_params
-                            target_params = {
-                                'timestamp': headers.get('timestamp'),
-                                'user-sign': headers.get('user-sign'),
-                                'web-id': headers.get('anonymous-user-id', '')
-                            }
-                            request_event.set()
-
-                    page.on("request", handle_request)
-
-                    try:
-                        navigation_task = asyncio.create_task(
-                            page.goto(self.api_config['base_referer'])
-                        )
-                        await asyncio.wait_for(request_event.wait(), timeout=7)
-                        await navigation_task
-                        
-                        if target_params:
-                            print("Parametri di autenticazione estratti con successo!")
-                            return target_params
-                            
-                    except Exception as e:
-                        print(f"Errore durante la navigazione nel tentativo {attempt + 1}: {e}")
-                    
-                finally:
-                    if browser:
-                        await browser.close()
+            await page.goto("https://www.tiktok.com/explore")
+            await page.wait_for_timeout(2000)
             
-            if attempt < self.config['MAX_AUTH_RETRIES'] - 1:
-                print(f"Attendo {self.config['AUTH_RETRY_DELAY']} secondi prima del prossimo tentativo...")
-                await asyncio.sleep(self.config['AUTH_RETRY_DELAY'])
-        
-        print("Impossibile ottenere i parametri di autenticazione dopo tutti i tentativi")
-        return None
+            # Estrai i parametri necessari
+            ms_token = await page.evaluate("localStorage.getItem('msToken')")
+            
+            await browser.close()
+            
+            if ms_token:
+                return {
+                    'timestamp': str(int(time.time())),
+                    'user-sign': ms_token,
+                    'web-id': ms_token
+                }
+            return None
 
     def fetch_tiktok_page(self, page: int, params: Dict, headers: Dict) -> List[Dict]:
         """Recupera una singola pagina di video"""
@@ -98,9 +68,8 @@ class TikTokScraper:
     def extract_video_data(self, url: str) -> Optional[Dict]:
         """Estrae i dati di un singolo video"""
         try:
-            tt_json = pyk.alt_get_tiktok_json(url)
-            
-            if tt_json is None:
+            response = requests.get(url, headers=self.headers)
+            if not response.ok:
                 return {
                     'titolo': 'Video non disponibile',
                     'creator': 'N/A',
@@ -110,32 +79,27 @@ class TikTokScraper:
                     'keywords': 'N/A'
                 }
             
-            if isinstance(tt_json, str):
-                try:
-                    tt_json = json.loads(tt_json)
-                except json.JSONDecodeError:
-                    return None
-
-            default_scope = tt_json.get('__DEFAULT_SCOPE__', {})
-            webapp_detail = default_scope.get('webapp.video-detail', {})
-            item_info = webapp_detail.get('itemInfo', {}).get('itemStruct', {})
-            
-            stats = item_info.get('stats', {})
-            views = stats.get('playCount', 'N/A') if isinstance(stats, dict) else 'N/A'
-            views_formatted = self.format_number(views) if views != 'N/A' else 'N/A'
-            
-            div_labels = item_info.get('diversificationLabels', [])
-            sug_words = item_info.get('suggestedWords', [])
-            
-            return {
-                'titolo': item_info.get('desc', 'N/A'),
-                'creator': item_info.get('author', {}).get('nickname', 'N/A'),
-                'url': url,
-                'views': views_formatted,
-                'categorie': ', '.join(div_labels) if div_labels else 'N/A',
-                'keywords': ', '.join(sug_words) if sug_words else 'N/A'
-            }
-            
+            # Estrai le informazioni dalla pagina
+            text = response.text
+            start_idx = text.find('"ItemModule":') + 13
+            end_idx = text.find(',"UserModule"')
+            if start_idx > 12 and end_idx > 0:
+                json_str = text[start_idx:end_idx]
+                item_data = json.loads(json_str)
+                
+                # Prendi il primo video
+                video_id = list(item_data.keys())[0]
+                video_info = item_data[video_id]
+                
+                return {
+                    'titolo': video_info.get('desc', 'N/A'),
+                    'creator': video_info.get('author', {}).get('nickname', 'N/A'),
+                    'url': url,
+                    'views': self.format_number(video_info.get('stats', {}).get('playCount', 'N/A')),
+                    'categorie': 'N/A',
+                    'keywords': 'N/A'
+                }
+                
         except Exception as e:
             print(f"Errore nell'estrazione dei dati per {url}: {str(e)}")
             return None
